@@ -8,6 +8,7 @@ LLM 客戶端 (LLM Client) 模組。
 
 import logging
 import json
+import asyncio
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion
 from typing import Dict
@@ -69,32 +70,55 @@ class LLMClient:
             }
         }
 
-        try:
-            response: ChatCompletion = await self._client.chat.completions.create(
-                model=self._model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                # 傳遞嚴格的 JSON Schema
-                response_format=structured_format,
-                temperature=0.0  # 設為 0 以追求最大的格式穩定性與減少幻覺
-            )
-        except Exception as e:
-            self._logger.error("LLM API 請求失敗: %s", str(e))
-            raise
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                response: ChatCompletion = await self._client.chat.completions.create(
+                    model=self._model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    # 傳遞嚴格的 JSON Schema
+                    response_format=structured_format,
+                    temperature=0.0  # 設為 0 以追求最大的格式穩定性與減少幻覺
+                )
+            except Exception as e:
+                self._logger.error("LLM API 請求失敗 (第 %d 次): %s", attempt, str(e))
+                if attempt == max_retries:
+                    raise
+                await asyncio.sleep(2)
+                continue
 
-        response_content = response.choices[0].message.content
+            response_content = response.choices[0].message.content
 
-        if not response_content:
-            self._logger.error("LLM API 回傳內容為空。")
-            raise ValueError("LLM API 返回結果為空")
+            if not response_content:
+                self._logger.error("LLM API 回傳內容為空 (第 %d 次)。", attempt)
+                if attempt == max_retries:
+                    raise ValueError("LLM API 返回結果為空")
+                await asyncio.sleep(2)
+                continue
 
-        try:
-            # 將回傳結果反序列化為字典回傳
-            parsed_data: Dict[str, object] = json.loads(response_content)
-            self._logger.debug("LLM 回傳 JSON 成功解析。")
-            return parsed_data
-        except json.JSONDecodeError as decode_error:
-            self._logger.error("無法將 LLM API 回傳結果解析為 JSON。原始文字: %s", response_content)
-            raise ValueError(f"LLM 輸出非有效 JSON 格式: {decode_error}")
+            # 清理可能的 Markdown 格式標籤 (例如 ```json ... ```)
+            cleaned_content = response_content.strip()
+            if cleaned_content.startswith("```json"):
+                cleaned_content = cleaned_content[7:]
+            elif cleaned_content.startswith("```"):
+                cleaned_content = cleaned_content[3:]
+            
+            if cleaned_content.endswith("```"):
+                cleaned_content = cleaned_content[:-3]
+                
+            cleaned_content = cleaned_content.strip()
+
+            try:
+                # 將回傳結果反序列化為字典回傳
+                parsed_data: Dict[str, object] = json.loads(cleaned_content)
+                self._logger.debug("LLM 回傳 JSON 成功解析。")
+                return parsed_data
+            except json.JSONDecodeError as decode_error:
+                self._logger.error("無法將 LLM API 回傳結果解析為 JSON (第 %d 次)。原始文字: %s", attempt, response_content)
+                if attempt == max_retries:
+                    raise ValueError(f"LLM 輸出非有效 JSON 格式: {decode_error}")
+                self._logger.info("準備重啟第 %d 次請求...", attempt + 1)
+                await asyncio.sleep(2)

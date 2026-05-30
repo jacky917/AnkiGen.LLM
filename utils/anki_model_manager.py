@@ -15,8 +15,15 @@ from typing import Dict
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from config_manager import config
+from utils.config_manager import config
 
+
+class AnkiNoteOptions(BaseModel):
+    """定義 AnkiConnect 的 duplicate 檢查行為。"""
+    model_config = ConfigDict(populate_by_name=True)
+    allowDuplicate: bool = False
+    duplicateScope: str = "deck"
+    duplicateScopeOptions: dict = Field(default_factory=dict)
 
 class AnkiNotePayload(BaseModel):
     """用於 AnkiConnect `addNote` action 的 params 結構。
@@ -26,6 +33,7 @@ class AnkiNotePayload(BaseModel):
         modelName (str): 目標模型名稱。
         fields (Dict[str, str]): 插入的欄位資料。
         tags (list[str]): 欲加入的標籤。
+        options (AnkiNoteOptions | None): 控制重複與否的行為配置。
     """
     model_config = ConfigDict(populate_by_name=True)
 
@@ -33,6 +41,7 @@ class AnkiNotePayload(BaseModel):
     modelName: str
     fields: Dict[str, str]
     tags: list[str] = Field(default_factory=list)
+    options: AnkiNoteOptions | None = None
 
 
 class AnkiActionContext(BaseModel):
@@ -135,11 +144,18 @@ class AnkiModelManager:
             else:
                 fields_data[str(k)] = str(v)
 
+        options = AnkiNoteOptions(
+            allowDuplicate=False,
+            duplicateScope="deck",
+            duplicateScopeOptions={"deckName": deck_name, "checkChildren": False, "checkAllModels": False}
+        )
+
         note_payload = AnkiNotePayload(
             deckName=deck_name,
             modelName=model_name,
             fields=fields_data,
-            tags=tags or []
+            tags=tags or [],
+            options=options
         )
 
         action = AnkiActionContext(
@@ -165,8 +181,15 @@ class AnkiModelManager:
         payload: dict[str, object] = action_context.model_dump(by_alias=True)
         self._logger.info("準備送出請求至 AnkiConnect，Action: %s", action_context.action)
 
+        headers = {}
+        if config.cf_access_client_id and config.cf_access_client_secret:
+            headers.update({
+                "CF-Access-Client-Id": config.cf_access_client_id,
+                "CF-Access-Client-Secret": config.cf_access_client_secret
+            })
+
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
                 response = await client.post(config.anki_connect_url, json=payload)
                 response.raise_for_status()
                 
@@ -175,6 +198,53 @@ class AnkiModelManager:
                 # 依循 AnkiConnect v6 標準回覆格式
                 error_msg = response_data.get("error")
                 if error_msg:
+                    if "duplicate" in error_msg.lower():
+                        detailed_err = None
+                        try:
+                            # 嘗試自動尋找衝突的卡片位在哪個牌組
+                            note_fields = payload.get("params", {}).get("note", {}).get("fields", {})
+                            if note_fields:
+                                # 預設對第一個欄位內容進行搜尋 (通常為單字或 Expression)
+                                first_field_val = list(note_fields.values())[0]
+                                find_payload = {"action": "findNotes", "version": 6, "params": {"query": f'"{first_field_val}"'}}
+                                find_res = await client.post(config.anki_connect_url, json=find_payload)
+                                note_ids = find_res.json().get("result", [])
+                                
+                                if note_ids:
+                                    info_payload = {"action": "notesInfo", "version": 6, "params": {"notes": note_ids}}
+                                    info_res = await client.post(config.anki_connect_url, json=info_payload)
+                                    info_data = info_res.json().get("result", [])
+                                    
+                                    decks = set()
+                                    for n_info in info_data:
+                                        card_ids = n_info.get("cards", [])
+                                        if card_ids:
+                                            c_payload = {"action": "cardsInfo", "version": 6, "params": {"cards": [card_ids[0]]}}
+                                            c_res = await client.post(config.anki_connect_url, json=c_payload)
+                                            c_results = c_res.json().get("result", [])
+                                            
+                                            # 確認 c_results[0] 存在並且為字典
+                                            if c_results and isinstance(c_results[0], dict):
+                                                deck_name = c_results[0].get("deckName")
+                                                if deck_name:
+                                                    decks.add(f"{deck_name}")
+                                                else:
+                                                    decks.add(f"未知牌組 (nid:{n_info.get('noteId')})")
+                                            else:
+                                                decks.add(f"找無卡片 (nid:{n_info.get('noteId')})")
+                                    
+                                    if decks:
+                                        deck_list_str = ", ".join(decks)
+                                        detailed_err = f"單字/內容 '{first_field_val}' 已經存在！\n👉 本地 Anki 搜尋: nid:{note_ids[0]}\n👉 所屬牌組: [{deck_list_str}]"
+
+                        except Exception as lookup_err:
+                            self._logger.warning("嘗試反查重複卡片所在牌組時失敗: %s", str(lookup_err))
+
+                        # 如果成功抓到重複的詳細資訊，則在此拋出 (避開上面的 except 捕捉)
+                        if detailed_err:
+                            self._logger.error(detailed_err)
+                            raise RuntimeError(f"AnkiConnect Duplicate Error: {detailed_err}")
+
                     self._logger.error("AnkiConnect 回傳內部錯誤: %s", error_msg)
                     raise RuntimeError(f"AnkiConnect Error: {error_msg}")
 
@@ -208,8 +278,15 @@ class AnkiModelManager:
             "version": 6
         }
         
+        headers = {}
+        if config.cf_access_client_id and config.cf_access_client_secret:
+            headers.update({
+                "CF-Access-Client-Id": config.cf_access_client_id,
+                "CF-Access-Client-Secret": config.cf_access_client_secret
+            })
+
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=60.0, headers=headers) as client:
                 response = await client.post(config.anki_connect_url, json=action_context)
                 response.raise_for_status()
                 
@@ -222,3 +299,109 @@ class AnkiModelManager:
         except httpx.HTTPError as http_error:
             self._logger.error("同步請求時發生通訊錯誤: %s", str(http_error))
             raise RuntimeError(f"Sync HTTP request failed: {http_error}")
+            
+    async def ensure_deck_exists(self, deck_name: str) -> None:
+        """檢查目標牌組是否存在，若否則嘗試從 AnkiWeb 同步一次，再不存在則拋出 RuntimeError。
+        
+        Args:
+            deck_name (str): 預期所在的目標牌組。
+            
+        Raises:
+            RuntimeError: 同步後依舊找不到目標牌組時拋出。
+        """
+        self._logger.info("檢查目標牌組是否存在: %s", deck_name)
+        
+        headers = {}
+        if config.cf_access_client_id and config.cf_access_client_secret:
+            headers.update({
+                "CF-Access-Client-Id": config.cf_access_client_id,
+                "CF-Access-Client-Secret": config.cf_access_client_secret
+            })
+            
+        async def fetch_decks() -> list[str]:
+            payload = {"action": "deckNames", "version": 6}
+            async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
+                resp = await client.post(config.anki_connect_url, json=payload)
+                resp.raise_for_status()
+                return resp.json().get("result", [])
+
+        decks = await fetch_decks()
+        if deck_name in decks:
+            return
+            
+        self._logger.warning("牌組 '%s' 不存在，嘗試執行 Anki 同步 (Sync)...", deck_name)
+        await self.sync_to_ankiweb()
+        
+        decks_after_sync = await fetch_decks()
+        if deck_name not in decks_after_sync:
+            err_msg = f"已強制同步，但 Anki 內依然未見目標牌組 '{deck_name}'！"
+            self._logger.error(err_msg)
+            raise RuntimeError(err_msg)
+            
+        self._logger.info("✅ 同步成功！在 Anki 內順利找到牌組 '%s'，繼續執行後續動作。", deck_name)
+
+    async def can_add_note(
+        self,
+        deck_name: str,
+        model_name: str,
+        fields: Dict[str, str]
+    ) -> bool:
+        """請求 AnkiConnect 檢查給定的筆記是否可以安全新增 (不重複且牌組/模型皆存在)。
+        
+        這可以在發送昂貴的 LLM 請求之前，先確認 Anki 的存取性以及避免重複生卡。
+        
+        Args:
+            deck_name (str): 目標牌組名稱。
+            model_name (str): 目標模型名稱。
+            fields (Dict[str, str]): 用來檢測的欄位，建議包含第一欄 (Primary Field) 以供防重機制檢查。
+            
+        Returns:
+            bool: 若可以新增則回傳 True，如果是重複卡片或遇到異常則回傳 False。
+            
+        Raises:
+            RuntimeError: 若與 AnkiConnect 網路斷線或通訊失敗則拋出異常。
+        """
+        self._logger.info("先期檢查是否可以新增筆記: [%s] at [%s]", model_name, deck_name)
+        payload = {
+            "action": "canAddNotes",
+            "version": 6,
+            "params": {
+                "notes": [
+                    {
+                        "deckName": deck_name,
+                        "modelName": model_name,
+                        "fields": fields
+                    }
+                ]
+            }
+        }
+        
+        headers = {}
+        if config.cf_access_client_id and config.cf_access_client_secret:
+            headers.update({
+                "CF-Access-Client-Id": config.cf_access_client_id,
+                "CF-Access-Client-Secret": config.cf_access_client_secret
+            })
+            
+        try:
+            async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+                resp = await client.post(config.anki_connect_url, json=payload)
+                resp.raise_for_status()
+                res_data = resp.json()
+                
+                if res_data.get("error"):
+                    self._logger.error("canAddNotes 回報錯誤: %s", res_data["error"])
+                    return False
+                    
+                results = res_data.get("result", [])
+                if results and len(results) > 0:
+                    can_add = bool(results[0])
+                    if not can_add:
+                        self._logger.warning("Anki 拒絕新增此卡片 (可能為重複或模型設定不符)。")
+                    return can_add
+                return False
+                
+        except httpx.HTTPError as http_error:
+            self._logger.error("canAddNotes 網路中斷或通訊發生錯誤: %s", str(http_error))
+            raise RuntimeError(f"AnkiConnect 連線異常: {http_error}")
+

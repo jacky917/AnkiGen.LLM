@@ -29,9 +29,9 @@ from dotenv import load_dotenv
 
 # ============================================================================
 # 載入 .env 環境變數
-# 使用 Path 定位與本檔案同目錄下的 .env 檔案，確保無論從哪裡執行都能正確載入
+# 使用 Path 定位專案根目錄下的 .env 檔案，確保無論從哪裡執行都能正確載入
 # ============================================================================
-_env_path = Path(__file__).resolve().parent / ".env"
+_env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=_env_path, override=True)
 
 # ============================================================================
@@ -114,11 +114,15 @@ class AnkiConnect:
             >>> # 自訂連線參數
             >>> ac = AnkiConnect(host='192.168.1.100', port=8765, api_key='my_secret')
         """
-        # 從環境變數讀取伺服器地址，若未設定則使用預設值 127.0.0.1
-        self._host = host or os.getenv("ANKI_CONNECT_HOST", "127.0.0.1")
-
-        # 從環境變數讀取端口號並轉為整數，若未設定則使用預設值 8765
-        self._port = port or int(os.getenv("ANKI_CONNECT_PORT", "8765"))
+        # 首先嘗試從環境變數讀取完整的 URL (與 config_manager.py 同步)
+        env_url = os.getenv("ANKI_CONNECT_URL")
+        if env_url:
+            self._url = env_url.rstrip("/")
+        else:
+            # 推回使用原本的 host / port 邏輯
+            self._host = host or os.getenv("ANKI_CONNECT_HOST", "127.0.0.1")
+            self._port = port or int(os.getenv("ANKI_CONNECT_PORT", "8765"))
+            self._url = f"http://{self._host}:{self._port}"
 
         # 從環境變數讀取 API 金鑰，空字串視為未設定
         self._api_key = api_key or os.getenv("ANKI_CONNECT_API_KEY", "") or None
@@ -126,11 +130,17 @@ class AnkiConnect:
         # 設定 HTTP 請求超時時間
         self._timeout = timeout
 
-        # 組合完整的 AnkiConnect API URL
-        self._url = f"http://{self._host}:{self._port}"
-
         # 建立 requests.Session 以提升連線效能（連線池復用）
         self._session = requests.Session()
+        
+        # 若有設定 Cloudflare Access 憑證，則統一寫入 Session Header 供遠端 API 穿透保護使用
+        cf_client_id = os.getenv("CF_ACCESS_CLIENT_ID")
+        cf_client_secret = os.getenv("CF_ACCESS_CLIENT_SECRET")
+        if cf_client_id and cf_client_secret:
+            self._session.headers.update({
+                "CF-Access-Client-Id": cf_client_id,
+                "CF-Access-Client-Secret": cf_client_secret
+            })
 
         logger.info("AnkiConnect 客戶端已初始化，目標地址: %s", self._url)
 
@@ -366,6 +376,70 @@ class AnkiConnect:
             {'Default': [1502032366472], 'Japanese::JLPT N3': [1502298036657]}
         """
         return self._invoke("getDecks", cards=cards)
+
+    def duplicate_deck(self, source_deck: str, destination_deck: str) -> None:
+        """複製牌組。
+
+        將源牌組（source_deck）的所有筆記完整複製到目的牌組（destination_deck），
+        包含筆記類型（model）、欄位內容（fields）和標籤（tags）。
+        若源牌組不存在，或是目的牌組已存在，將印出錯誤訊息並終止程式。
+
+        Args:
+            source_deck: 來源牌組名稱。
+            destination_deck: 目的牌組名稱。
+
+        Raises:
+            SystemExit: 源牌組不存在或目的牌組已存在時退出程式。
+            AnkiConnectError: API 請求失敗時。
+
+        Example:
+            >>> ac.duplicate_deck('Template Deck', 'New Deck')
+        """
+        import sys
+        decks = self.get_deck_names()
+        
+        if source_deck not in decks:
+            logger.error(f"源牌組 '{source_deck}' 不存在。")
+            print(f"錯誤：源牌組 '{source_deck}' 不存在。")
+            sys.exit(1)
+            
+        if destination_deck in decks:
+            logger.error(f"目的牌組 '{destination_deck}' 已存在。")
+            print(f"錯誤：目的牌組 '{destination_deck}' 已存在。")
+            sys.exit(1)
+
+        # 取得源牌組內所有筆記 ID
+        note_ids = self.find_notes(f'"deck:{source_deck}"')
+        
+        # 建立目的牌組
+        self.create_deck(destination_deck)
+        
+        if not note_ids:
+            logger.warning(f"源牌組 '{source_deck}' 中沒有任何筆記。僅建立空的目的牌組 '{destination_deck}'。")
+            return
+            
+        # 取得源牌組所有筆記的詳細資訊
+        notes_info = self.get_notes_info(notes=note_ids)
+        
+        # 準備要新增的筆記列表
+        new_notes = []
+        for info in notes_info:
+            fields = {k: v['value'] for k, v in info['fields'].items()}
+            
+            new_notes.append({
+                "deckName": destination_deck,
+                "modelName": info['modelName'],
+                "fields": fields,
+                "tags": info['tags'],
+                "options": {
+                    "allowDuplicate": True
+                }
+            })
+            
+        # 批次新增筆記至目的牌組
+        if new_notes:
+            self.add_notes(new_notes)
+            logger.info(f"成功複製 {len(new_notes)} 則筆記從 '{source_deck}' 到 '{destination_deck}'。")
 
     # ========================================================================
     # 筆記操作（Note Actions）

@@ -40,7 +40,7 @@
             },
             "translation": {
               "type": "string",
-              "description": "中文意"
+              "description": "中文翻譯"
             },
             "nuance": {
               "type": "string",

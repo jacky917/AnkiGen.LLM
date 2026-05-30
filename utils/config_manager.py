@@ -13,6 +13,11 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+from pathlib import Path
+
+# 動態計算專案根目錄下的 .env 檔案位置，避免執行路徑不同導致找不到
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+
 class ConfigManager(BaseSettings):
     """應用程式配置管理類別。
 
@@ -26,7 +31,7 @@ class ConfigManager(BaseSettings):
         log_level (str): 應用程式的預設日誌層級，預設為 INFO。
     """
     model_config = SettingsConfigDict(
-        env_file="../.env",
+        env_file=str(_env_path),
         env_file_encoding="utf-8",
         extra="ignore"
     )
@@ -38,6 +43,8 @@ class ConfigManager(BaseSettings):
         default="http://127.0.0.1:8765",
         description="AnkiConnect 本地端點"
     )
+    cf_access_client_id: str | None = Field(default=None, description="Cloudflare Access Client ID")
+    cf_access_client_secret: str | None = Field(default=None, description="Cloudflare Access Client Secret")
     log_level: str = Field(default="INFO", description="系統日誌層級 (DEBUG/INFO/WARNING/ERROR)")
 
     def setup_logging(self) -> None:
